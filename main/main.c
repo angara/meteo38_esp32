@@ -1,0 +1,524 @@
+#include "stdlib.h"
+#include <time.h>
+#include "esp_system.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "driver/gpio.h"
+#include "string.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/task.h"
+
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
+#include "esp_wifi.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "lwip/apps/sntp.h"
+#include "lwip/netdb.h"
+#include "driver/uart.h"
+
+#include "esp_timer.h"
+#include <stdio.h>
+
+#define RS 13
+#define E 12
+#define D4 14
+#define D5 27
+#define D6 26
+#define D7 25
+#define LED 2
+
+#define GPIO_OUTPUT_PIN_SEL  ((1ULL<<RS) | (1ULL<<E) | (1ULL<<LED))
+#define GPIO_OUTPUT_PIN_SEL2 ((1ULL<<D4) | (1ULL<<D5) | (1ULL<<D6) | (1ULL<<D7))
+
+#define DEFAULT_SCAN_LIST_SIZE 20
+#define ESP_MAXIMUM_RETRY 20
+
+#define ESP_WIFI_SSID "D-Link"
+#define ESP_WIFI_PASS "temp_passw_4215"
+#define HOST_IP_ADDR "192.168.0.1"
+
+//#define DEFAULT_SCAN_LIST_SIZE CONFIG_SCAN_LIST_SIZE
+
+#define PORT 12345
+
+//static const char *payload = "Message from ESP32 ";
+
+#define KEEPALIVE_IDLE 60
+#define KEEPALIVE_INTERVAL 10
+#define KEEPALIVE_COUNT 10
+
+static EventGroupHandle_t s_wifi_event_group;
+
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+
+static const char *TAG = "TEMP VIEWER";
+static int s_retry_num = 0;
+
+time_t now;
+struct tm timeinfo;
+SemaphoreHandle_t xSemaphore;
+bool connect_enable = false;
+TaskHandle_t xHandle = NULL;
+TaskHandle_t TaskHandle;	
+eTaskState TaskState;
+
+static esp_err_t set_dns_server(esp_netif_t *netif, uint32_t addr, esp_netif_dns_type_t type)
+{
+    if (addr && (addr != IPADDR_NONE)) {
+        esp_netif_dns_info_t dns;
+        dns.ip.u_addr.ip4.addr = addr;
+        dns.ip.type = IPADDR_TYPE_V4;
+        ESP_ERROR_CHECK(esp_netif_set_dns_info(netif, type, &dns));
+    }
+    return ESP_OK;
+}
+
+static void event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+		ESP_LOGI(TAG, "WIFI_EVENT_STA_START");
+        esp_wifi_connect();
+    }
+	else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_WIFI_READY) {
+		ESP_LOGI(TAG, "WIFI_EVENT_WIFI_READY");
+    }
+	else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_SCAN_DONE) {
+		ESP_LOGI(TAG, "WIFI_EVENT_SCAN_DONE");
+    }
+	else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_STOP) {
+		ESP_LOGI(TAG, "WIFI_EVENT_STA_STOP");
+    }
+	else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+		connect_enable = true;
+		ESP_LOGI(TAG, "connect ENABLE");
+		ESP_LOGI(TAG, "WIFI_EVENT_STA_CONNECTED");
+    }
+	else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_BEACON_TIMEOUT) {
+		//TaskHandle=xTaskGetHandle("tcp_client");		// Получение дескриптора в соответствии с названием задачи
+		//TaskState=(TaskHandle);
+		ESP_LOGI(TAG, "Get State: %d", eTaskGetState(xHandle));
+		//vTaskResume(xHandle);
+		ESP_LOGI(TAG, "WIFI_EVENT_STA_BEACON_TIMEOUT");
+    }
+	else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+		connect_enable = false;
+		ESP_LOGI(TAG, "connect DISABLE");
+		ESP_LOGI(TAG, "WIFI_EVENT_STA_DISCONNECTED");
+		
+		//close(sock);
+		//vTaskDelete(xHandle);
+        if (s_retry_num < ESP_MAXIMUM_RETRY) {
+			ESP_LOGI(TAG, "retry to connect: %d/%d", s_retry_num, ESP_MAXIMUM_RETRY);
+           	esp_wifi_connect();
+           	s_retry_num++;
+			vTaskDelay(1);
+        }
+		else {
+			ESP_LOGI(TAG, "cannot to connect");
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        	ESP_LOGI(TAG,"connect to the AP fail");
+		}
+    }
+	else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+		ESP_LOGI(TAG, "IP_EVENT_STA_GOT_IP");
+	        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        	ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        	s_retry_num = 0;
+        	xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+			//example_set_static_ip(arg);
+    	}
+	else ESP_LOGI(TAG,"ELSE!!! %d-%d", (int) event_base, (int)event_id);
+}
+
+void time_sync_notification_cb(struct timeval *tv)
+{
+    ESP_LOGI(TAG, "Notification of a time synchronization event");
+}
+
+/*static void sntp_task()
+{
+	char strftime_buf[64];
+	time(&now);
+	localtime_r(&now, &timeinfo);
+	ESP_LOGI(TAG, "timeinfo.tm_year = %d", timeinfo.tm_year);
+    if (timeinfo.tm_year < (2016 - 1900)) {
+        ESP_LOGI(TAG, "Time is not set yet. Connecting to WiFi and getting time over NTP.");
+        #ifdef LWIP_DHCP_GET_NTP_SRV
+		sntp_servermode_dhcp(1);
+		#endif
+		
+		ESP_LOGI(TAG, "Initializing SNTP");
+		sntp_setoperatingmode(SNTP_OPMODE_POLL);
+		sntp_setservername(0, "ntp1.niiftri.irkutsk.ru");
+		sntp_setservername(1, "ntp2.niiftri.irkutsk.ru");
+		sntp_setservername(2, "time.nist.gov");
+		sntp_setservername(3, "time.windows.com");
+		sntp_setservername(4, "pool.ntp.org");
+		sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+		sntp_init();
+
+		ESP_LOGI(TAG, "List of configured NTP servers:");
+
+		for (uint8_t i = 0; i < SNTP_MAX_SERVERS; ++i){
+			if (sntp_getservername(i)){
+				ESP_LOGI(TAG, "server %d: %s", i, sntp_getservername(i));
+			} else {
+				char buff[INET6_ADDRSTRLEN];
+				ip_addr_t const *ip = sntp_getserver(i);
+				if (ipaddr_ntoa_r(ip, buff, INET6_ADDRSTRLEN) != NULL)
+					ESP_LOGI(TAG, "server %d: %s", i, buff);
+			}
+		}
+
+		time_t now = 0;
+		struct tm timeinfo = { 0 };
+		int retry = 0;
+		const int retry_count = 10;
+		while (sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET && ++retry < retry_count) {
+			ESP_LOGI(TAG, "Waiting for system time to be set... (%d/%d)", retry, retry_count);
+			vTaskDelay(2);
+		}
+		time(&now);
+		localtime_r(&now, &timeinfo);
+    }
+    setenv("TZ", "<+08>-8", 1);
+    tzset();
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    if (timeinfo.tm_year < (2016 - 1900)) ESP_LOGE(TAG, "The current date/time error");
+    else {
+        strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+		ESP_LOGI(TAG, "Date: %02d-%02d-%04d. Time: %02d:%02d:%02d", timeinfo.tm_mday, timeinfo.tm_mon+1, timeinfo.tm_year+1900, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+		ESP_LOGI(TAG, "The current date/time in Irkutsk is: %s", strftime_buf);
+    }
+}
+*/
+
+static void print_auth_mode(int authmode)
+{
+    switch (authmode) {
+    case WIFI_AUTH_OPEN:
+        ESP_LOGI(TAG, "Authmode \tWIFI_AUTH_OPEN");
+        break;
+    case WIFI_AUTH_WEP:
+        ESP_LOGI(TAG, "Authmode \tWIFI_AUTH_WEP");
+        break;
+    case WIFI_AUTH_WPA_PSK:
+        ESP_LOGI(TAG, "Authmode \tWIFI_AUTH_WPA_PSK");
+        break;
+    case WIFI_AUTH_WPA2_PSK:
+        ESP_LOGI(TAG, "Authmode \tWIFI_AUTH_WPA2_PSK");
+        break;
+    case WIFI_AUTH_WPA_WPA2_PSK:
+        ESP_LOGI(TAG, "Authmode \tWIFI_AUTH_WPA_WPA2_PSK");
+        break;
+    case WIFI_AUTH_WPA2_ENTERPRISE:
+        ESP_LOGI(TAG, "Authmode \tWIFI_AUTH_WPA2_ENTERPRISE");
+        break;
+    case WIFI_AUTH_WPA3_PSK:
+        ESP_LOGI(TAG, "Authmode \tWIFI_AUTH_WPA3_PSK");
+        break;
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+        ESP_LOGI(TAG, "Authmode \tWIFI_AUTH_WPA2_WPA3_PSK");
+        break;
+    default:
+        ESP_LOGI(TAG, "Authmode \tWIFI_AUTH_UNKNOWN");
+        break;
+    }
+}
+static void print_cipher_type(int pairwise_cipher, int group_cipher)
+{
+    switch (pairwise_cipher) {
+    case WIFI_CIPHER_TYPE_NONE:
+        ESP_LOGI(TAG, "Pairwise Cipher \tWIFI_CIPHER_TYPE_NONE");
+        break;
+    case WIFI_CIPHER_TYPE_WEP40:
+        ESP_LOGI(TAG, "Pairwise Cipher \tWIFI_CIPHER_TYPE_WEP40");
+        break;
+    case WIFI_CIPHER_TYPE_WEP104:
+        ESP_LOGI(TAG, "Pairwise Cipher \tWIFI_CIPHER_TYPE_WEP104");
+        break;
+    case WIFI_CIPHER_TYPE_TKIP:
+        ESP_LOGI(TAG, "Pairwise Cipher \tWIFI_CIPHER_TYPE_TKIP");
+        break;
+    case WIFI_CIPHER_TYPE_CCMP:
+        ESP_LOGI(TAG, "Pairwise Cipher \tWIFI_CIPHER_TYPE_CCMP");
+        break;
+    case WIFI_CIPHER_TYPE_TKIP_CCMP:
+        ESP_LOGI(TAG, "Pairwise Cipher \tWIFI_CIPHER_TYPE_TKIP_CCMP");
+        break;
+    default:
+        ESP_LOGI(TAG, "Pairwise Cipher \tWIFI_CIPHER_TYPE_UNKNOWN");
+        break;
+    }
+
+    switch (group_cipher) {
+    case WIFI_CIPHER_TYPE_NONE:
+        ESP_LOGI(TAG, "Group Cipher \tWIFI_CIPHER_TYPE_NONE");
+        break;
+    case WIFI_CIPHER_TYPE_WEP40:
+        ESP_LOGI(TAG, "Group Cipher \tWIFI_CIPHER_TYPE_WEP40");
+        break;
+    case WIFI_CIPHER_TYPE_WEP104:
+        ESP_LOGI(TAG, "Group Cipher \tWIFI_CIPHER_TYPE_WEP104");
+        break;
+    case WIFI_CIPHER_TYPE_TKIP:
+        ESP_LOGI(TAG, "Group Cipher \tWIFI_CIPHER_TYPE_TKIP");
+        break;
+    case WIFI_CIPHER_TYPE_CCMP:
+        ESP_LOGI(TAG, "Group Cipher \tWIFI_CIPHER_TYPE_CCMP");
+        break;
+    case WIFI_CIPHER_TYPE_TKIP_CCMP:
+        ESP_LOGI(TAG, "Group Cipher \tWIFI_CIPHER_TYPE_TKIP_CCMP");
+        break;
+    default:
+        ESP_LOGI(TAG, "Group Cipher \tWIFI_CIPHER_TYPE_UNKNOWN");
+        break;
+    }
+}
+static void wifi_init(void)
+{
+	s_wifi_event_group = xEventGroupCreate();
+	ESP_LOGI(TAG, "--NETIF_INIT--");
+	ESP_ERROR_CHECK(esp_netif_init());
+	ESP_LOGI(TAG, "--LOOP_CREATE_DEFAULT--");
+	ESP_ERROR_CHECK(esp_event_loop_create_default());
+	esp_event_handler_instance_t instance_any_id;
+	esp_event_handler_instance_t instance_got_ip;
+	ESP_LOGI(TAG, "--EVENT_HANDLER--");
+	ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+	ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+	ESP_LOGI(TAG, "--CREATE_DEFAULT_WIFI_STA--");
+    esp_netif_t *my_sta = esp_netif_create_default_wifi_sta();
+	esp_netif_dhcpc_stop(my_sta);
+
+    esp_netif_ip_info_t ip_info;
+
+    IP4_ADDR(&ip_info.ip, 192, 168, 1, 122);
+   	IP4_ADDR(&ip_info.gw, 192, 168, 1, 1);
+   	IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+
+    esp_netif_set_ip_info(my_sta, &ip_info);
+	ESP_ERROR_CHECK(set_dns_server(my_sta, ipaddr_addr("8.8.8.8"), ESP_NETIF_DNS_MAIN));
+	ESP_ERROR_CHECK(set_dns_server(my_sta, ipaddr_addr("8.8.4.4"), ESP_NETIF_DNS_BACKUP));
+	ESP_LOGI(TAG, "WIFI_INIT_CONFIG_DEFAULT--");
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+	ESP_LOGI(TAG, "--WIFI_INIT--");
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+	ESP_LOGI(TAG, "--WIFI_SET_MODE--");
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+	ESP_LOGI(TAG, "--WIFI_START--");
+    ESP_ERROR_CHECK(esp_wifi_start());
+	//uint16_t inact_time;
+	//ESP_ERROR_CHECK (esp_wifi_get_inactive_time(WIFI_IF_STA, &inact_time));
+	//ESP_LOGI(TAG, "esp_wifi_get_inactive_time = %d", inact_time);
+}
+
+static void wifi_scan(void)
+{
+	uint16_t number = DEFAULT_SCAN_LIST_SIZE;
+    wifi_ap_record_t ap_info[DEFAULT_SCAN_LIST_SIZE];
+    uint16_t ap_count = 0;
+    memset(ap_info, 0, sizeof(ap_info));
+	ESP_LOGI(TAG, "--WIFI_SCAN_START--");
+	esp_wifi_disconnect();
+    esp_wifi_scan_start(NULL, true);
+	ESP_LOGI(TAG, "--WIFI_SCAN_GET_RECORDS--");
+    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&number, ap_info));
+    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
+    ESP_LOGI(TAG, "Total APs scanned = %u", ap_count); //1
+    for (int i = 0; (i < DEFAULT_SCAN_LIST_SIZE) && (i < ap_count); i++) {
+        ESP_LOGI(TAG, "SSID \t\t%s", ap_info[i].ssid);
+        ESP_LOGI(TAG, "RSSI \t\t%d", ap_info[i].rssi);
+        print_auth_mode(ap_info[i].authmode);
+        if (ap_info[i].authmode != WIFI_AUTH_WEP) {
+            print_cipher_type(ap_info[i].pairwise_cipher, ap_info[i].group_cipher);
+        }
+        ESP_LOGI(TAG, "Channel \t\t%d\n", ap_info[i].primary);
+    }
+	ESP_LOGI(TAG, "--WIFI_STOP--");
+    ESP_ERROR_CHECK(esp_wifi_stop());
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = ESP_WIFI_SSID,
+            .password = ESP_WIFI_PASS,
+			.threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
+        },
+    };
+	ESP_LOGI(TAG, "--WIFI_SET_CONFIG--");
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+	ESP_LOGI(TAG, "--WIFI_START--");
+    ESP_ERROR_CHECK(esp_wifi_start() );
+	EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,pdFALSE,pdFALSE,portMAX_DELAY);
+	if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
+                 ESP_WIFI_SSID, ESP_WIFI_PASS);
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
+                 ESP_WIFI_SSID, ESP_WIFI_PASS);
+    } else {
+        ESP_LOGE(TAG, "UNEXPECTED EVENT");
+    }
+}
+
+static void _delay(uint32_t time_us)
+{
+//    ets_delay_us(time_us*1000);
+    //    os_delay_us(time_us);
+	vTaskDelay(time_us / portTICK_PERIOD_MS);
+	//vTaskDelay(time_us);
+}
+
+static void tcp_client_task(void *pvParameters)
+{
+	char rx_buffer[128];
+	char addr_str[128];
+	int addr_family;
+	int ip_protocol;
+
+	while(1)
+	{
+		if (!connect_enable) vTaskSuspend( NULL );
+	    struct sockaddr_in destAddr;
+	    destAddr.sin_addr.s_addr = inet_addr(HOST_IP_ADDR);
+        destAddr.sin_family = AF_INET;
+        destAddr.sin_port = htons(PORT);
+        addr_family = AF_INET;
+        ip_protocol = IPPROTO_IP;
+        inet_ntoa_r(destAddr.sin_addr, addr_str, sizeof(addr_str) - 1);
+		int sock =  socket(addr_family, SOCK_STREAM, ip_protocol);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+            break;
+        }
+        ESP_LOGI(TAG, "Socket created");
+
+       	int err = connect(sock, (struct sockaddr *)&destAddr, sizeof(destAddr));
+        if (err != 0) {
+            ESP_LOGE(TAG, "Socket unable to connect: errno %d", errno);
+			close(sock);
+			vTaskDelay(1000 / portTICK_PERIOD_MS);
+            continue;
+        }
+        ESP_LOGI(TAG, "Successfully connected");
+
+       	while (1)
+        {
+			int len = 0;
+	        len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+	        if (len < 0)
+	        {
+				ESP_LOGE(TAG, "recv failed: errno %d", errno);
+				break;
+	        }
+	        //else if ((len < 64) | (len > 250))
+			else if ((len < 4) | (len > 250))
+	        {
+				ESP_LOGW(TAG, "incorrect packet size: %d", len);
+				continue;
+	        }
+	        else
+	        {
+				rx_buffer[len] = 0;
+				ESP_LOGI(TAG, "Received %d bytes from %s:", len, addr_str);
+				ESP_LOGI(TAG, "%s", (char *) rx_buffer);
+	        }
+	        vTaskDelay(100 / portTICK_PERIOD_MS);
+        }
+        if (sock != -1) {
+        	ESP_LOGE(TAG, "Shutting down socket and restarting...");
+	        shutdown(sock, 0);
+        	close(sock);
+        }
+		ESP_LOGE(TAG, "BREAK1");
+		break;
+	}
+	ESP_LOGE(TAG, "BREAK2");
+	ESP_LOGI(TAG, "connect DISABLE");
+	connect_enable = false;
+	
+	ESP_LOGI(TAG, "--WIFI_DISCONNECT--");
+    ESP_ERROR_CHECK(esp_wifi_disconnect());
+	vTaskDelay(1000 / portTICK_PERIOD_MS);
+	vTaskDelete(NULL);
+}
+
+void app_main(void)
+{
+	esp_err_t ret = nvs_flash_init();
+	if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+	{
+		ESP_ERROR_CHECK(nvs_flash_erase());
+		ret = nvs_flash_init();
+	}
+	ESP_ERROR_CHECK(ret);
+	
+	wifi_init();
+	wifi_scan();
+	//sntp_task();
+	_delay(10);
+
+
+	xSemaphore = xSemaphoreCreateBinary();
+	if( xSemaphore == NULL ) ESP_LOGI(TAG, "Cannot create semaphore"); else ESP_LOGI(TAG, "Semaphore created"); 
+	
+//	xTaskCreate(tcp_server_task, "tcp_server", 4096, (void*)AF_INET, 5, NULL);
+	xTaskCreate(tcp_client_task, "tcp_client", 4096, NULL, 5, &xHandle);
+	while(1)
+	{
+		
+		//wifi_scan();
+		//ESP_ERROR_CHECK( esp_wifi_stop() );
+		//ESP_ERROR_CHECK( esp_wifi_start() );
+		
+		while(connect_enable)
+		{
+			ESP_LOGI(TAG, "Before xTask");
+			vTaskResume(xHandle);
+			vTaskDelay(1000 / portTICK_PERIOD_MS);
+			while(connect_enable)
+			{
+				vTaskDelay(100 / portTICK_PERIOD_MS);
+				//	vTaskDelay(10 / portTICK_RATE_MS);
+				//		vTaskDelay(10);
+			}
+			
+			ESP_LOGI(TAG, "After xTask");
+		}
+		vTaskDelay(1000 / portTICK_PERIOD_MS);
+		//esp_wifi_connect();
+	}
+	
+	//tcp_server_task((void*)AF_INET);
+	//fclose(f);
+	ESP_LOGE(TAG, "UNREGISTER EVENT HANDLER");
+    ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler));
+    ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler));
+    vEventGroupDelete(s_wifi_event_group);
+    ESP_LOGE(TAG, "UNREGISTERED EVENT HANDLER!!!");
+}
