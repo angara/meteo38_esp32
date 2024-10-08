@@ -60,6 +60,15 @@ static EventGroupHandle_t s_wifi_event_group;
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
+#define I2C_MASTER_SCL_IO           4
+#define I2C_MASTER_SDA_IO           5
+#define I2C_MASTER_NUM              0
+#define I2C_MASTER_FREQ_HZ          400000
+#define I2C_MASTER_TX_BUF_DISABLE   0
+#define I2C_MASTER_RX_BUF_DISABLE   0
+#define I2C_MASTER_TIMEOUT_MS       1000
+#define BME280_SENSOR_ADDR          0x76
+
 static const char *TAG = "TEMP VIEWER";
 static int s_retry_num = 0;
 
@@ -138,6 +147,29 @@ static void event_handler(void* arg, esp_event_base_t event_base,
 			//example_set_static_ip(arg);
     	}
 	else ESP_LOGI(TAG,"ELSE!!! %d-%d", (int) event_base, (int)event_id);
+}
+
+static esp_err_t i2c_master_init(void)
+{
+    int i2c_master_port = I2C_MASTER_NUM;
+
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_MASTER_SDA_IO,
+        .scl_io_num = I2C_MASTER_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = I2C_MASTER_FREQ_HZ,
+    };
+
+    i2c_param_config(i2c_master_port, &conf);
+
+    return i2c_driver_install(i2c_master_port, conf.mode, I2C_MASTER_RX_BUF_DISABLE, I2C_MASTER_TX_BUF_DISABLE, 0);
+}
+
+static esp_err_t bme280_register_read(uint8_t reg_addr, uint8_t *data, size_t len)
+{
+    return i2c_master_write_read_device(I2C_MASTER_NUM, MPU9250_SENSOR_ADDR, &reg_addr, 1, data, len, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
 }
 
 void time_sync_notification_cb(struct timeval *tv)
@@ -483,6 +515,19 @@ void app_main(void)
 	//sntp_task();
 	_delay(10);
 
+	uint8_t data[2];
+    ESP_ERROR_CHECK(i2c_master_init());
+    ESP_LOGI(TAG, "I2C initialized successfully");
+
+    /* Read the MPU9250 WHO_AM_I register, on power up the register should have the value 0x71 */
+    ESP_ERROR_CHECK(mpu9250_register_read(MPU9250_WHO_AM_I_REG_ADDR, data, 1));
+    ESP_LOGI(TAG, "WHO_AM_I = %X", data[0]);
+
+    /* Demonstrate writing by reseting the MPU9250 */
+    ESP_ERROR_CHECK(mpu9250_register_write_byte(MPU9250_PWR_MGMT_1_REG_ADDR, 1 << MPU9250_RESET_BIT));
+
+    ESP_ERROR_CHECK(i2c_driver_delete(I2C_MASTER_NUM));
+    ESP_LOGI(TAG, "I2C de-initialized successfully");
 
 	xSemaphore = xSemaphoreCreateBinary();
 	if( xSemaphore == NULL ) ESP_LOGI(TAG, "Cannot create semaphore"); else ESP_LOGI(TAG, "Semaphore created"); 
