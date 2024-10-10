@@ -23,6 +23,7 @@
 #include "lwip/apps/sntp.h"
 #include "lwip/netdb.h"
 #include "driver/uart.h"
+#include "driver/i2c.h"
 
 #include "esp_timer.h"
 #include <stdio.h>
@@ -68,6 +69,11 @@ static EventGroupHandle_t s_wifi_event_group;
 #define I2C_MASTER_RX_BUF_DISABLE   0
 #define I2C_MASTER_TIMEOUT_MS       1000
 #define BME280_SENSOR_ADDR          0x76
+#define BME280_WHO_AM_I_REG_ADDR           0x75
+
+#define BME280_PWR_MGMT_1_REG_ADDR         0x6B
+#define BME280_RESET_BIT                   7
+
 
 static const char *TAG = "TEMP VIEWER";
 static int s_retry_num = 0;
@@ -169,7 +175,17 @@ static esp_err_t i2c_master_init(void)
 
 static esp_err_t bme280_register_read(uint8_t reg_addr, uint8_t *data, size_t len)
 {
-    return i2c_master_write_read_device(I2C_MASTER_NUM, MPU9250_SENSOR_ADDR, &reg_addr, 1, data, len, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
+    return i2c_master_write_read_device(I2C_MASTER_NUM, BME280_SENSOR_ADDR, &reg_addr, 1, data, len, I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
+}
+
+static esp_err_t bme280_register_write_byte(uint8_t reg_addr, uint8_t data)
+{
+    int ret;
+    uint8_t write_buf[2] = {reg_addr, data};
+
+    ret = i2c_master_write_to_device(I2C_MASTER_NUM, BME280_SENSOR_ADDR, write_buf, sizeof(write_buf), I2C_MASTER_TIMEOUT_MS / portTICK_PERIOD_MS);
+
+    return ret;
 }
 
 void time_sync_notification_cb(struct timeval *tv)
@@ -519,12 +535,12 @@ void app_main(void)
     ESP_ERROR_CHECK(i2c_master_init());
     ESP_LOGI(TAG, "I2C initialized successfully");
 
-    /* Read the MPU9250 WHO_AM_I register, on power up the register should have the value 0x71 */
-    ESP_ERROR_CHECK(mpu9250_register_read(MPU9250_WHO_AM_I_REG_ADDR, data, 1));
+    /* Read the BME280 WHO_AM_I register, on power up the register should have the value 0x71 */
+    ESP_ERROR_CHECK(bme280_register_read(BME280_WHO_AM_I_REG_ADDR, data, 1));
     ESP_LOGI(TAG, "WHO_AM_I = %X", data[0]);
 
-    /* Demonstrate writing by reseting the MPU9250 */
-    ESP_ERROR_CHECK(mpu9250_register_write_byte(MPU9250_PWR_MGMT_1_REG_ADDR, 1 << MPU9250_RESET_BIT));
+    /* Demonstrate writing by reseting the BME280 */
+    ESP_ERROR_CHECK(bme280_register_write_byte(BME280_PWR_MGMT_1_REG_ADDR, 1 << BME280_RESET_BIT));
 
     ESP_ERROR_CHECK(i2c_driver_delete(I2C_MASTER_NUM));
     ESP_LOGI(TAG, "I2C de-initialized successfully");
